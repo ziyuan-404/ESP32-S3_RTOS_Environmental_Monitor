@@ -1,0 +1,6 @@
+plerup/EspAsyncWebServer@^1.2.3
+adafruit/Adafruit BMP280 Library@^2.6.8
+adafruit/Adafruit AHTX0@^2.0.2
+knolleary/PubSubClient@^2.8
+bblanchon/ArduinoJson@^6.19.4
+adafruit/Adafruit Unified Sensor@^1.1.5

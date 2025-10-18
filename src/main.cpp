@@ -1,107 +1,80 @@
-// =================================================================================
-// == ESP32 温湿度及多通道气体监测器 V5 - 主文件 (main.cpp) ==
-// == 职责: 程序入口，初始化并驱动各个模块运行。
-// =================================================================================
-
+/**
+ * =================================================================================
+ * == ESP32 环境监测器 V6 (FreeRTOS 重构版) - 主文件 (main.cpp) ==
+ *
+ * 职责:
+ * - 程序入口。
+ * - 初始化所有硬件、服务和全局资源 (互斥锁, 事件组, 队列)。
+ * - 创建并启动所有独立的 FreeRTOS 任务。
+ * - 启动 FreeRTOS 调度器 (通过返回空的 loop() 实现)。
+ *
+ * =================================================================================
+ */
 #include <Arduino.h>
 #include "config.h"
-#include "data_manager.h"
-#include "sensor_handler.h"
-#include "web_handler.h"
-#include "onenet_handler.h" // 包含OneNET头文件
+#include "app_globals.h"
+#include "storage/storage_manager.h"
+#include "tasks/task_sensor.h"
+#include "tasks/task_wifi.h"
+#include "tasks/task_web_server.h"
+#include "tasks/task_onenet.h"
+#include "tasks/task_system_control.h"
 
-// ==========================================================================
-// == Arduino `setup()` 函数 ==
-// ==========================================================================
 void setup() {
+    // 启动串行通信用于调试
     Serial.begin(115200);
-    P_PRINTLN("\n[SETUP] 系统启动中...");
+    Serial.println("\n[SETUP] 系统启动 (FreeRTOS 重构版)...");
 
-    // 初始化硬件
-    initHardware();
+    // 1. 初始化全局变量和 FreeRTOS 同步对象 (必须在所有任务创建前完成)
+    init_globals();
+    Serial.println("[SETUP] 全局变量和同步对象初始化完毕。");
 
-    // 初始化文件系统
-    initSPIFFS();
+    // 2. 初始化硬件 (LED, 蜂鸣器等)
+    // 注意: 传感器相关的硬件初始化已移至 sensor_task 内部
+    init_system_hardware();
+    Serial.println("[SETUP] 系统控制硬件 (LED, 蜂鸣器) 初始化完毕。");
 
-    // 加载配置和历史数据
-    loadConfig(currentConfig);
-    loadHistoricalDataFromFile(historicalData);
+    // 3. 初始化并挂载文件系统
+    init_spiffs();
+    Serial.println("[SETUP] SPIFFS 文件系统初始化完毕。");
 
-    // 根据加载的配置更新硬件状态
-    updateLedBrightness(currentConfig.ledBrightness);
+    // 4. 从 SPIFFS 加载配置和历史数据
+    // 加载操作现在受互斥锁保护
+    load_config();
+    load_historical_data();
+    Serial.println("[SETUP] 配置和历史数据加载完毕。");
 
-    // 初始化网络服务 (WiFi, DNS, Web Server, WebSocket)
-    initWiFiAndWebServer(currentConfig, wifiState);
-
-    // 设置气体传感器预热结束时间
-    gasSensorWarmupEndTime = millis() + GAS_SENSOR_WARMUP_PERIOD_MS;
-
-    // 创建用于校准的信号量和任务
-    calibrationSemaphore = xSemaphoreCreateBinary();
-    if (calibrationSemaphore != NULL) {
-        P_PRINTLN("[SETUP] 校准信号量创建成功。");
-        xTaskCreatePinnedToCore(
-            calibrationTask,          // 任务函数
-            "CalibrationTask",        // 任务名称
-            4096,                     // 堆栈大小 (Bytes)
-            NULL,                     // 任务输入参数
-            1,                        // 任务优先级
-            &calibrationTaskHandle,   // 任务句柄
-            0                         // 核心
-        );
-        P_PRINTLN("[SETUP] 校准任务创建成功并已启动。");
-    } else {
-        P_PRINTLN("[SETUP] ***错误*** 校准信号量创建失败！");
-    }
-
-    // 初始化并启动OneNET MQTT任务
-    initOneNetMqttTask();
+    // 5. 根据加载的配置应用初始状态
+    // (例如，设置LED亮度)
+    SystemControlMessage led_msg;
+    led_msg.command = CMD_SET_BRIGHTNESS;
     
-    P_PRINTLN("[SETUP] 初始化完成, 系统运行中.");
+    // 安全地读取配置
+    xSemaphoreTake(g_configMutex, portMAX_DELAY);
+    led_msg.value = g_currentConfig.ledBrightness;
+    xSemaphoreGive(g_configMutex);
+
+    xQueueSend(g_systemControlQueue, &led_msg, 0);
+    Serial.printf("[SETUP] 应用初始LED亮度: %d%%\n", led_msg.value);
+
+
+    // 6. 创建所有应用程序任务
+    Serial.println("[SETUP] 开始创建所有应用任务...");
+    create_wifi_task();
+    create_web_server_task();
+    create_sensor_task();
+    create_system_control_task();
+    create_onenet_task();
+    Serial.println("[SETUP] 所有应用任务创建成功。");
+
+    // 7. setup() 结束, FreeRTOS 调度器将接管 CPU 控制
+    Serial.println("[SETUP] 初始化完成，FreeRTOS 调度器已启动。");
 }
 
-// ==========================================================================
-// == Arduino `loop()` 函数 ==
-// ==========================================================================
 void loop() {
-    // 处理网络相关任务
-    network_loop();
-
-    // 获取当前时间
-    unsigned long currentTime = millis();
-
-    // 周期性地执行传感器读取、警报检查和数据记录
-    if (currentTime - lastSensorReadTime >= SENSOR_READ_INTERVAL_MS) {
-        lastSensorReadTime = currentTime;
-        
-        // 只有在非校准状态下才进行常规读数和警报检查
-        if (currentState.calibrationState == CAL_IDLE) {
-            readSensors(currentState, currentConfig);
-            checkAlarms(currentState, currentConfig);
-            addHistoricalDataPoint(historicalData, currentState);
-        }
-    }
-
-    // 更新LED和蜂鸣器状态
-    updateLedStatus(currentState, wifiState);
-    controlBuzzer(currentState);
-
-    // 周期性地通过WebSocket广播数据
-    if (currentTime - lastWebSocketUpdateTime >= WEBSOCKET_UPDATE_INTERVAL_MS) {
-        lastWebSocketUpdateTime = currentTime;
-        // 仅在非连接/扫描/校准状态下广播，避免干扰
-        if ((wifiState.connectProgress == WIFI_CP_IDLE || wifiState.connectProgress == WIFI_CP_FAILED) && !wifiState.isScanning && currentState.calibrationState == CAL_IDLE) {
-            sendSensorDataToClients(currentState);
-            sendWifiStatusToClients(wifiState);
-        }
-    }
-
-    // 周期性地将历史数据保存到闪存
-    if (currentTime - lastHistoricalDataSaveTime >= HISTORICAL_DATA_SAVE_INTERVAL_MS) {
-        lastHistoricalDataSaveTime = currentTime;
-        // 避免在校准时保存数据
-        if (currentState.calibrationState == CAL_IDLE) {
-            saveHistoricalDataToFile(historicalData);
-        }
-    }
+    // Arduino loop() 在 FreeRTOS 架构下保持为空。
+    // 所有功能都在各自的任务中执行。
+    // 主动让出CPU，防止 loopTask 占用过多资源。
+    vTaskDelay(portMAX_DELAY);
 }
+
