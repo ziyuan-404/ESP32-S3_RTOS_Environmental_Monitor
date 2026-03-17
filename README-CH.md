@@ -1,6 +1,6 @@
 # **ESP32-S3 RTOS 环境监测系统**
 
-[English Version](https://github.com/ziyuan-404/WouoUI-esp32s3/blob/main/README-CH.md)
+[English Version](https://github.com/ziyuan-404/ESP32-S3_RTOS_Environmental_Monitor/blob/main/README.md)
 
 ## **概览**
 
